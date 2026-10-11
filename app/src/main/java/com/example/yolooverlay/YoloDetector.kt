@@ -37,7 +37,7 @@ class YoloDetector(
     private val labels: List<String>,
     modelAsset: String = "yolov8n.onnx",
     /** 网络输入边长；仅当模型元数据和预热都拿不到尺寸时作为兜底 */
-    inputSizeHint: Int = 640,
+    private val inputSizeHint: Int = 640,
     initialConf: Float = 0.25f,
     initialIou: Float = 0.45f,
     private val maxDetections: Int = 50,
