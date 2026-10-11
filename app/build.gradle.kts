@@ -38,9 +38,9 @@ android {
         jvmTarget = "17"
     }
 
-    // .tflite 必须保持未压缩，否则无法用 AssetFileDescriptor 做 mmap
+    // 模型文件保持未压缩，方便以后需要 mmap 时直接 openFd
     androidResources {
-        noCompress += "tflite"
+        noCompress += listOf("tflite", "onnx")
     }
 
     packaging {
@@ -52,9 +52,7 @@ dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-ktx:1.9.2")
 
-    // TensorFlow Lite 运行时（CPU/NNAPI）
-    implementation("org.tensorflow:tensorflow-lite:2.16.1")
-
-    // 可选：GPU 代理。需要时打开下面这行，并把 YoloDetector 里的 GPU 分支放开。
-    // implementation("org.tensorflow:tensorflow-lite-gpu:2.16.1")
+    // ONNX Runtime for Android：Maven 依赖，自带全部 ABI 的预编译 .so，不需要 NDK。
+    // 自带 XNNPACK，ARM 上比 TFLite CPU 快。
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
 }

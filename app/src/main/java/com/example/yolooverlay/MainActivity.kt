@@ -97,7 +97,7 @@ class MainActivity : ComponentActivity() {
 
         root.addView(title("YOLOv8 屏幕实时识别"))
         root.addView(caption(
-            "原理：MediaProjection 抓屏 → YOLOv8 TFLite 推理 → 悬浮窗绘制。\n" +
+            "原理：MediaProjection 抓屏 → YOLOv8 ONNX 推理 → 悬浮窗绘制。\n" +
                 "绘制层带 FLAG_NOT_TOUCHABLE，手指事件全部穿透到下方 App，正常点击不受影响。"
         ))
 
@@ -190,7 +190,7 @@ class MainActivity : ComponentActivity() {
 
         root.addView(sectionTitle("模型文件"))
         root.addView(caption(
-            "把 yolov8n_float32.tflite 放到 app/src/main/assets/ 再重新安装。\n" +
+            "把 yolov8n.onnx 放到 app/src/main/assets/ 再重新安装。\n" +
                 "导出命令见 tools/export_yolov8.py 或 README。"
         ))
 

@@ -40,7 +40,7 @@ class OverlayService : Service(), YoloPipeline.Listener {
         private const val CHANNEL_ID = "yolo_overlay_channel"
         private const val NOTIF_ID = 0x1001
 
-        const val DEFAULT_MODEL = "yolov8n_float32.tflite"
+        const val DEFAULT_MODEL = "yolov8n.onnx"
 
         const val ACTION_START = "com.example.yolooverlay.action.START"
         const val ACTION_STOP = "com.example.yolooverlay.action.STOP"

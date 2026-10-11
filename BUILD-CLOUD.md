@@ -35,7 +35,7 @@ C:\Users\ADMIN\Desktop\    github.com/              （临时 Ubuntu 虚拟机
         │  上传一次文件           │  检测到 push             │
         └───────────────────────>├─────────────────────────>│
                                  │                          │ 装 JDK17
-                                 │                          │ 导出 tflite 模型
+                                 │                          │ 导出 onnx 模型
                                  │                          │ 下载 Gradle 8.7
                                  │                          │ gradle assembleDebug
                                  │                          │
@@ -63,7 +63,7 @@ C:\Users\ADMIN\Desktop\    github.com/              （临时 Ubuntu 虚拟机
 1. 把一堆文本文件（总共约 82 KB）传上去
 2. 从网上下一个约 10 MB 的 APK
 
-**真正吃内存的活（Gradle、Kotlin 编译器、TensorFlow、dex 打包）全部在 16GB 的 runner 上跑。**
+**真正吃内存的活（Gradle、Kotlin 编译器、ONNX 导出、dex 打包）全部在 16GB 的 runner 上跑。**
 你的容器从头到尾没运行过一个编译进程。
 
 ### 顺带解决了模型问题
@@ -247,27 +247,27 @@ Actions → 左边选 **Build APK** → 右边点 **Run workflow** 下拉 → �
 | Checkout | 把你的仓库下载到虚拟机 | 2 s | — |
 | Set up JDK 17 | 装 Java 编译器 | 10 s | — |
 | Set up Python 3.11 | 装 Python | 10 s | — |
-| **Export YOLOv8n → TFLite** | 装 ultralytics（含 torch），下载 `yolov8n.pt`，导出 tflite，复制进 `assets/` | **2~4 分钟** | 最后 `ls -lh` 应该列出 `yolov8n_float32.tflite` |
-| **Verify TFLite model shapes** | 打印模型真实输入输出形状 | 30 s | **⚠️ 这步最重要，见下** |
+| **Export YOLOv8n → ONNX** | 装 ultralytics（含 torch），下载 `yolov8n.pt`，导出 ONNX，复制进 `assets/` | **1.5~3 分钟** | 最后 `ls -lh` 应该列出 `yolov8n.onnx` |
+| **Verify ONNX model shapes** | 打印模型真实输入输出形状 | 20 s | **⚠️ 这步最重要，见下** |
 | Ensure Android SDK 34 | 确认 SDK 平台和 build-tools 在 | 20 s | `ls` 出的列表里有 `android-34` |
 | Cache Gradle | 恢复依赖缓存 | 10 s | 第一次是空的，正常 |
 | Install Gradle 8.7 | 下载 Gradle 到 `$HOME/.gradle-dist` | 40 s | 最后打印 Gradle 版本号 |
 | **Build debug APK** | 真正编译 | **3~5 分钟** | 最后 `BUILD SUCCESSFUL` |
-| Show APK | 列出产物 | 2 s | `app-debug.apk`（含 4 个 CPU 架构的 TFLite 库 + 6MB 模型，约 25~35 MB） |
+| Show APK | 列出产物 | 2 s | `app-debug.apk`（含 4 个 CPU 架构的 ONNX Runtime 库 + 12MB 模型，约 60~90 MB） |
 | Upload APK as artifact | 存成 Artifact | 20 s | — |
 | Publish APK to Release | 发 Release | 10 s | 打印 release URL |
 
 **总计约 6~10 分钟。** 第一次跑没有缓存，会偏慢。
 
-### ⚠️ 必须检查的一步：Verify TFLite model shapes
+### ⚠️ 必须检查的一步：Verify ONNX model shapes
 
 这步的日志会长这样（**正确**的样子）：
 
 ```
-模型文件: app/src/main/assets/yolov8n_float32.tflite
-  INPUT  serving_default_images:0 [  1 640 640   3] float32
-  OUTPUT StatefulPartitionedCall:0 [   1  84 8400] float32
->> 期望: INPUT [1,640,640,3] float32
+模型文件: app/src/main/assets/yolov8n.onnx
+  INPUT  images [1, 640, 640, 3] tensor(float)
+  OUTPUT output0 [1, 84, 8400] tensor(float)
+>> 期望: INPUT  [1,640,640,3] float32
 >> 期望: OUTPUT 含一维 = 84 (4+80) 的 [1,84,8400] 或 [1,8400,84]
 ```
 
@@ -380,7 +380,7 @@ python tools/export_yolov8.py --model yolov8s.pt --imgsz 640
 ```
 
 同时把 `OverlayService.kt` 里的 `DEFAULT_MODEL` 和文件名对上（导出 `yolov8s.pt` 会得到
-`yolov8s_float32.tflite`）。
+`yolov8s.onnx`）。
 
 ### 想手动重跑
 
@@ -400,16 +400,21 @@ Gradle 依赖有缓存（`Cache Gradle` 那步），第二次之后 `Build debug
 - 邮箱没验证 → 去邮箱点确认链接
 - 仓库是 fork 的（Action 默认关闭）→ 进 Settings → Actions → 允许
 
-### 构建在 Export YOLOv8n -> TFLite 失败
+### 构建在 Export YOLOv8n -> ONNX 失败
 
-最常见。看具体报错：
+看具体报错：
 
 | 报错关键词 | 原因 | 处理 |
 |---|---|---|
 | `Could not find a version that satisfies the requirement ultralytics` | PyPI 临时抽风 | 点 **Re-run failed jobs** |
-| `onnx2tf` / `tensorflow` 相关 | ultralytics 版本变动导致依赖变了 | 把 `pip install ultralytics` 改成 `pip install "ultralytics==8.3.0"` 固定版本 |
+| `onnxslim` / `onnx` 相关 | ultralytics 版本变动导致依赖变了 | 加 `--no-simplify` 参数，或固定 ultralytics 版本 |
 | `No such file or directory: 'tools/export_yolov8.py'` | 第 3 步漏传了 `tools/` 文件夹 | 补传 |
 | 下载 `yolov8n.pt` 超时 | 网络抖动 | Re-run |
+
+> 📌 **历史坑（已解决）**：如果日志里出现
+> `LiteRT: export failure: '_OpNamespace' 'aten' object has no attribute 'cholesky'`，
+> 说明 ultralytics 试图走 TFLite/LiteRT 导出路径。本项目已改用 `format="onnx"` 规避，
+> 见 [app/src/main/assets/README.md](app/src/main/assets/README.md)。
 
 ### 构建在 Build debug APK 失败
 
@@ -418,13 +423,13 @@ Gradle 依赖有缓存（`Cache Gradle` 那步），第二次之后 `Build debug
 | `Failed to find target with hash string 'android-34'` | SDK 34 没装上 | 看 `Ensure Android SDK 34` 那步日志里 `ls` 出的平台列表 |
 | `Could not find method ... ` / `Unresolved reference` | 第 3 步漏传了 .kt 文件 | 检查 `app/src/main/java/com/example/yolooverlay/` 是否有 **9 个** .kt |
 | `Unsupported class file major version` | JDK 版本不对 | 确认 `Set up JDK 17` 那步是绿色 |
-| `Could not resolve org.tensorflow:tensorflow-lite:2.16.1` | Maven 网络抖动 | Re-run |
+| `Could not resolve com.microsoft.onnxruntime:onnxruntime-android:1.20.0` | Maven 网络抖动 | Re-run |
 | `gradle: command not found` | Gradle 没进 PATH | 看 `Install Gradle 8.7` 日志最后有没有打印版本号 |
 
 ### APK 装上去但一个框都不画
 
-App 会弹 toast「**找不到模型文件 assets/yolov8n_float32.tflite**」→ 说明模型没打进包里。
-回看 `Export YOLOv8n -> TFLite` 那步的 `ls -lh` 输出。
+App 会弹 toast「**找不到模型文件 assets/yolov8n.onnx**」→ 说明模型没打进包里。
+回看 `Export YOLOv8n -> ONNX` 那步的 `ls -lh` 输出。
 
 ### 悬浮窗一闪就没了
 

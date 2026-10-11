@@ -32,8 +32,11 @@ jobs:
           python-version: '3.11'
 
       # ---------------------------------------------------------------- 模型
-      # 本地不导出模型，全部在云端做。导出结果直接落进 assets/。
-      - name: Export YOLOv8n -> TFLite
+      # 用 ONNX 而不是 TFLite：
+      #   ultralytics >= 8.4.83 废弃了 format="tflite"，内部强制改成 format="litert"，
+      #   而 litert_torch 在 CI 上会报 '_OpNamespace' 'aten' object has no attribute 'cholesky'。
+      #   ONNX 是依赖最少、最稳的导出路径，Android 侧用 onnxruntime-android 推理。
+      - name: Export YOLOv8n -> ONNX
         run: |
           set -e
           python -m pip install --upgrade pip
@@ -44,20 +47,19 @@ jobs:
       # 关键：把模型的真实输入/输出形状打出来。
       # YoloDetector 会在运行时探测输出布局，但如果导出格式不对（比如带了 NMS），
       # 这一步的日志能立刻看出来，不用等装到手机上才发现。
-      - name: Verify TFLite model shapes
+      - name: Verify ONNX model shapes
         run: |
-          python -c "import tensorflow" 2>/dev/null || pip install tensorflow-cpu
+          python -c "import onnxruntime" 2>/dev/null || pip install onnxruntime
           python - <<'PY'
-          import glob, tensorflow as tf
-          p = glob.glob("app/src/main/assets/*.tflite")[0]
-          it = tf.lite.Interpreter(model_path=p)
-          it.allocate_tensors()
+          import glob, onnxruntime as ort
+          p = glob.glob("app/src/main/assets/*.onnx")[0]
+          s = ort.InferenceSession(p, providers=["CPUExecutionProvider"])
           print("模型文件:", p)
-          for d in it.get_input_details():
-              print("  INPUT ", d["name"], d["shape"], d["dtype"].__name__)
-          for d in it.get_output_details():
-              print("  OUTPUT", d["name"], d["shape"], d["dtype"].__name__)
-          print(">> 期望: INPUT [1,640,640,3] float32")
+          for i in s.get_inputs():
+              print("  INPUT ", i.name, i.shape, i.type)
+          for o in s.get_outputs():
+              print("  OUTPUT", o.name, o.shape, o.type)
+          print(">> 期望: INPUT  [1,640,640,3] float32")
           print(">> 期望: OUTPUT 含一维 = 84 (4+80) 的 [1,84,8400] 或 [1,8400,84]")
           PY
 

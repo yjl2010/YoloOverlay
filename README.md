@@ -1,13 +1,20 @@
 # YOLO 悬浮识别（Android）
 
-用 **YOLOv8 (TFLite)** 在 Android 上抓取整个屏幕画面，实时推理，并用**悬浮窗**把检测框和置信度画在屏幕最上层。
+用 **YOLOv8 (ONNX Runtime)** 在 Android 上抓取整个屏幕画面，实时推理，并用**悬浮窗**把检测框和置信度画在屏幕最上层。
 
 绘制层带 `FLAG_NOT_TOUCHABLE`，手指事件 100% 穿透到下面的 App，正常点击 / 滑动 / 打字都不受影响。
 
 ```
-MediaProjection 抓屏  →  VirtualDisplay + ImageReader  →  YOLOv8 TFLite 推理  →  悬浮窗 Canvas 绘制
+MediaProjection 抓屏  →  VirtualDisplay + ImageReader  →  YOLOv8 ONNX 推理  →  悬浮窗 Canvas 绘制
    （全屏镜像）            （RGBA → ARGB IntArray）        （letterbox + NMS）      （触摸穿透）
 ```
+
+> ⚠️ **关于模型格式**：ultralytics 从 **8.4.83** 起废弃了 `format="tflite"`，源码里强制改写成
+> `format="litert"`，而 LiteRT 导出链对 torch 版本极其敏感，CI 上常直接报
+> `'_OpNamespace' 'aten' object has no attribute 'cholesky'`。
+> 所以本项目改用 **ONNX**：它是 ultralytics 里依赖最少、最稳的导出路径，
+> Android 侧用 `onnxruntime-android`（Maven 依赖，自带预编译 `.so`，同样不需要 NDK）。
+> 详见 [app/src/main/assets/README.md](app/src/main/assets/README.md)。
 
 ---
 
@@ -20,20 +27,21 @@ MediaProjection 抓屏  →  VirtualDisplay + ImageReader  →  YOLOv8 TFLite �
 ### 1. 导出模型（在你的 PC 上）
 
 ```bash
-pip install -U ultralytics
+pip install -U ultralytics onnxruntime
 python tools/export_yolov8.py
 ```
 
-脚本会自动把 `yolov8n_float32.tflite` 复制到 `app/src/main/assets/`。
+脚本会自动把 `yolov8n.onnx` 复制到 `app/src/main/assets/`。
 
 也可以手动来：
 
 ```bash
-yolo export model=yolov8n.pt format=tflite imgsz=640 half=False int8=False
-copy yolov8n_saved_model\yolov8n_float32.tflite  app\src\main\assets\
+yolo export model=yolov8n.pt format=onnx imgsz=640 half=False
+copy yolov8n.onnx  app\src\main\assets\
 ```
 
-> ⚠️ 只支持 **float32** 导出。`int8` / `float16` 的输入输出类型不同，需要自行改 `YoloDetector`。
+> ⚠️ 只支持 **float32 单输出** 的导出。加了 `nms=True` 会变成多个输出张量，需要重写
+> `YoloDetector.decode()`。输入必须是 `[1,640,640,3]`，输出含一个 84 的维度。
 
 ### 2. 编译安装
 
@@ -145,14 +153,14 @@ app/src/main/java/com/example/yolooverlay/
 ├── MainActivity.kt          授权流程 + 参数设置界面
 ├── OverlayService.kt        前台服务：持有 MediaProjection，管理两个悬浮窗
 ├── YoloPipeline.kt          采集 + 推理流水线（双线程、丢帧、缓冲池）
-├── YoloDetector.kt          TFLite 推理：letterbox / 解码 / 逐类 NMS
+├── YoloDetector.kt          ONNX Runtime 推理：letterbox / 解码 / 逐类 NMS
 ├── OverlayView.kt           穿透绘制层：画框、标签、置信度、FPS HUD
 ├── FloatingButtonView.kt    可触摸的小球控件
 ├── Detection.kt             检测结果数据类
 ├── CocoLabels.kt            COCO 80 类（含中文名）
 └── ScreenUtils.kt           全屏物理尺寸获取
 
-app/src/main/assets/         ← 把 yolov8n_float32.tflite 放这里
+app/src/main/assets/         ← 把 yolov8n.onnx 放这里
 tools/export_yolov8.py       模型导出脚本
 ```
 
@@ -163,13 +171,13 @@ tools/export_yolov8.py       模型导出脚本
 1. **Android 14+ 每次启动都要重新授权录屏**，系统限制，无法绕过。
 2. **`FLAG_SECURE` 的内容抓不到**（银行 App、Netflix、部分密码框），会显示成黑块，这是系统安全机制。
 3. 抓屏时系统会常驻一个「正在共享屏幕」的提示，无法隐藏。
-4. 只支持 **float32 TFLite** 单输出的 YOLOv8 模型；如果用了 `--nms` 导出（内置 NMS），
+4. 只支持 **float32 单输出** 的 YOLOv8 ONNX 模型；如果用了 `nms=True` 导出（内置 NMS），
    输出张量数量会变，需要改 `YoloDetector.decode()`。
 5. **自己画的框也会被抓进画面**（MediaProjection 抓的是合成后的屏幕，包含悬浮层），
    理论上存在反馈回路。实际影响很小（框很细，输入又被缩到 640），
    但如果发现某个物体反复被“自激发”，把置信度阈值调高即可。
-6. 推理在 CPU 上跑，长时间使用会发热降频。GPU Delegate 可以进一步加速，
-   打开 `app/build.gradle.kts` 里注释掉的那行依赖，再在 `YoloDetector` 的 `options` 里加 delegate 即可。
+6. 推理默认跑 CPU（ORT 自带 XNNPACK）。想再快可以打开界面里的 NNAPI 开关
+   （`YoloDetector` 里调 `SessionOptions.addNnapi()`），部分机型明显更快，部分反而更慢。
 7. 悬浮窗在小球位置会吃掉触摸（这是刻意的，否则没法控制）。不想留就把球拖到边角。
 8. 编译用 `compileSdk = 34` + AGP 8.5.2 + JDK 17 + Gradle 8.7。
    想上 API 35 记得把 AGP 一起升到 8.7 以上。

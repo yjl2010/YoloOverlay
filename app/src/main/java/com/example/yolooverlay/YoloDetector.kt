@@ -2,32 +2,35 @@ package com.example.yolooverlay
 
 import android.content.Context
 import android.util.Log
-import org.tensorflow.lite.Interpreter
-import java.io.FileInputStream
+import ai.onnxruntime.OnnxTensor
+import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtSession
+import ai.onnxruntime.TensorInfo
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.nio.MappedByteBuffer
-import java.nio.channels.FileChannel
+import java.nio.FloatBuffer
 import java.util.Arrays
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
- * YOLOv8 TFLite 推理器（float32 输入，640x640）。
+ * YOLOv8 ONNX 推理器（ONNX Runtime for Android）。
  *
  * 输入：一帧 ARGB_8888 的 IntArray（来自 MediaProjection 的 RGBA 采集） + 宽高
  * 输出：原图坐标系下的检测框列表
  *
- * 假定导出方式为 `model.export(format="tflite")`，即：
- *   输入  [1, 640, 640, 3] float32, RGB, 归一化到 0..1
- *   输出  [1, 4+nc, 8400] float32, 已经过 sigmoid（v8 无 objectness 分支）
+ * 模型：`model.export(format="onnx", imgsz=640)` 的产物，即
+ *   输入  images   [1, 640, 640, 3] float32, RGB, 归一化到 0..1
+ *   输出  output0  [1, 4+nc, 8400] float32, 已经过 sigmoid（v8 无 objectness 分支）
  * 代码会在运行时探测输出布局，[1, 8400, 4+nc] 或二维输出也能正确解析。
+ *
+ * 为什么不用 TFLite：见 tools/export_yolov8.py 顶部注释。
  */
 class YoloDetector(
     context: Context,
     private val labels: List<String>,
-    modelAsset: String = "yolov8n_float32.tflite",
+    modelAsset: String = "yolov8n.onnx",
     val inputSize: Int = 640,
     initialConf: Float = 0.25f,
     initialIou: Float = 0.45f,
@@ -43,17 +46,13 @@ class YoloDetector(
     @Volatile
     var iouThreshold: Float = initialIou
 
-    companion object {
-        private const val TAG = "YoloDetector"
-        private const val PAD_VALUE = 114f / 255f
-    }
-
-    private val numClasses = labels.size
-    private val interpreter: Interpreter
-    private val inputBuffer: ByteBuffer
+    private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
+    private val session: OrtSession
+    private val inputName: String
+    private val inputShape: LongArray
+    private val inputBuffer: FloatBuffer
     private val inputFloats = FloatArray(inputSize * inputSize * 3)
 
-    private var outputBuffer: ByteBuffer
     private var outFloats = FloatArray(0)
 
     // 输出布局缓存
@@ -61,46 +60,56 @@ class YoloDetector(
     private var numAnchors = 0
     private var numChannels = 0
 
+    private val numClasses = labels.size
+
     init {
         require(labels.isNotEmpty()) { "labels 不能为空" }
-        val options = Interpreter.Options()
-        if (useNnapi) {
-            @Suppress("DEPRECATION")
-            options.setUseNNAPI(true)
-        } else {
-            options.setNumThreads(numThreads)
-        }
-        interpreter = Interpreter(loadModelFile(context, modelAsset), options)
 
+        val options = OrtSession.SessionOptions()
+        options.setIntraOpNumThreads(numThreads)
+        try {
+            options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+        } catch (t: Throwable) {
+            Log.w(TAG, "设置优化级别失败，用默认值", t)
+        }
+        if (useNnapi) {
+            try {
+                options.addNnapi()
+            } catch (t: Throwable) {
+                Log.w(TAG, "NNAPI 不可用，回退到 CPU", t)
+            }
+        }
+
+        val modelBytes = loadModelBytes(context, modelAsset)
+        Log.i(TAG, "模型 ${modelAsset} 读取完成 ${modelBytes.size} 字节")
+
+        session = env.createSession(modelBytes, options)
+        try {
+            options.close()
+        } catch (_: Throwable) {
+        }
+
+        inputName = session.inputNames.first()
+        inputShape = longArrayOf(1L, inputSize.toLong(), inputSize.toLong(), 3L)
         inputBuffer = ByteBuffer
             .allocateDirect(inputSize * inputSize * 3 * 4)
             .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
 
-        val outTensor = interpreter.getOutputTensor(0)
-        outputBuffer = ByteBuffer
-            .allocateDirect(outTensor.numBytes())
-            .order(ByteOrder.nativeOrder())
-        prepareOutputLayout(outTensor.shape())
+        val outName = session.outputNames.first()
+        val info = session.outputInfo[outName]
+        if (info !is TensorInfo) error("无法读取输出张量信息")
+        prepareOutputLayout(info.shape.map { it.toInt() }.toIntArray())
 
         Log.i(
             TAG,
-            "模型已加载 input=${interpreter.getInputTensor(0).shape().toList()} " +
-                "output=${outTensor.shape().toList()} dtype=${outTensor.dataType()} " +
+            "模型已加载 input=$inputName ${inputShape.toList()} output=$outName " +
                 "channelsFirst=$channelsFirst anchors=$numAnchors channels=$numChannels"
         )
     }
 
-    private fun loadModelFile(context: Context, assetName: String): MappedByteBuffer {
-        context.assets.openFd(assetName).use { afd ->
-            FileInputStream(afd.fileDescriptor).use { fis ->
-                return fis.channel.map(
-                    FileChannel.MapMode.READ_ONLY,
-                    afd.startOffset,
-                    afd.declaredLength
-                )
-            }
-        }
-    }
+    private fun loadModelBytes(context: Context, assetName: String): ByteArray =
+        context.assets.open(assetName).use { it.readBytes() }
 
     private fun prepareOutputLayout(shape: IntArray) {
         val expect = 4 + numClasses
@@ -121,10 +130,9 @@ class YoloDetector(
                     channelsFirst = false; numChannels = shape[1]; numAnchors = shape[0]
                 }
             }
-            else -> error("不支持的输出维度 ${shape.size}")
+            else -> error("不支持的输出维度 ${shape.size}: ${shape.toList()}")
         }
         outFloats = FloatArray(numAnchors * numChannels)
-        Log.i(TAG, "输出解析: channelsFirst=$channelsFirst anchors=$numAnchors channels=$numChannels")
     }
 
     /**
@@ -141,15 +149,18 @@ class YoloDetector(
 
         letterbox(pixels, srcWidth, srcHeight, newW, newH, padX, padY)
 
-        inputBuffer.rewind()
-        inputBuffer.asFloatBuffer().put(inputFloats)
+        inputBuffer.clear()
+        inputBuffer.put(inputFloats)
         inputBuffer.rewind()
 
-        outputBuffer.rewind()
-        interpreter.run(inputBuffer, outputBuffer)
-
-        outputBuffer.rewind()
-        outputBuffer.asFloatBuffer().get(outFloats, 0, outFloats.size)
+        OnnxTensor.createTensor(env, inputBuffer, inputShape).use { input ->
+            session.run(mapOf(inputName to input)).use { result ->
+                val out = result.get(0) as OnnxTensor
+                val fb = out.floatBuffer
+                fb.rewind()
+                fb.get(outFloats, 0, outFloats.size)
+            }
+        }
 
         val raw = decode(padX, padY, scale, srcWidth, srcHeight)
         val kept = nms(raw)
@@ -280,8 +291,13 @@ class YoloDetector(
 
     fun close() {
         try {
-            interpreter.close()
+            session.close()
         } catch (_: Throwable) {
         }
+    }
+
+    private companion object {
+        const val TAG = "YoloDetector"
+        const val PAD_VALUE = 114f / 255f
     }
 }
