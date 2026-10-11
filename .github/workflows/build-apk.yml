@@ -1,0 +1,124 @@
+name: Build APK
+
+# 触发方式：
+#   1. 推到 main / master 分支
+#   2. 在 GitHub 网页上点 Actions -> Build APK -> Run workflow 手动触发
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    # 云端机器：4 核 / 16GB 内存 / 14GB 磁盘，Android SDK 已预装
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # ---------------------------------------------------------------- 模型
+      # 本地不导出模型，全部在云端做。导出结果直接落进 assets/。
+      - name: Export YOLOv8n -> TFLite
+        run: |
+          set -e
+          python -m pip install --upgrade pip
+          pip install ultralytics
+          python tools/export_yolov8.py --model yolov8n.pt --imgsz 640
+          ls -lh app/src/main/assets/
+
+      # 关键：把模型的真实输入/输出形状打出来。
+      # YoloDetector 会在运行时探测输出布局，但如果导出格式不对（比如带了 NMS），
+      # 这一步的日志能立刻看出来，不用等装到手机上才发现。
+      - name: Verify TFLite model shapes
+        run: |
+          python -c "import tensorflow" 2>/dev/null || pip install tensorflow-cpu
+          python - <<'PY'
+          import glob, tensorflow as tf
+          p = glob.glob("app/src/main/assets/*.tflite")[0]
+          it = tf.lite.Interpreter(model_path=p)
+          it.allocate_tensors()
+          print("模型文件:", p)
+          for d in it.get_input_details():
+              print("  INPUT ", d["name"], d["shape"], d["dtype"].__name__)
+          for d in it.get_output_details():
+              print("  OUTPUT", d["name"], d["shape"], d["dtype"].__name__)
+          print(">> 期望: INPUT [1,640,640,3] float32")
+          print(">> 期望: OUTPUT 含一维 = 84 (4+80) 的 [1,84,8400] 或 [1,8400,84]")
+          PY
+
+      # ---------------------------------------------------------------- 构建
+      # 用 runner 预装的 Android SDK（ANDROID_HOME 已设置）
+      - name: Ensure Android SDK 34
+        run: |
+          # runner 上 SDK 一般在 /usr/local/lib/android/sdk；兜底补上环境变量
+          if [ -z "$ANDROID_HOME" ] && [ -d /usr/local/lib/android/sdk ]; then
+            echo "ANDROID_HOME=/usr/local/lib/android/sdk" >> "$GITHUB_ENV"
+            echo "ANDROID_SDK_ROOT=/usr/local/lib/android/sdk" >> "$GITHUB_ENV"
+          fi
+          if command -v sdkmanager >/dev/null 2>&1; then
+            yes | sdkmanager --licenses >/dev/null 2>&1 || true
+            sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools" || true
+          else
+            echo "sdkmanager 不在 PATH，直接用 runner 预装的 SDK"
+          fi
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/platforms"   || true
+          ls "$ANDROID_HOME/build-tools" || true
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      # 工程里没带 wrapper，这里显式装一个 Gradle 8.7（AGP 8.5.2 要求 >= 8.7）
+      - name: Install Gradle 8.7
+        run: |
+          # 注意：不要解压到 /opt —— GitHub runner 上 /opt 归 root 所有，runner 用户写不进去
+          curl -sSL -o "$RUNNER_TEMP/gradle.zip" https://services.gradle.org/distributions/gradle-8.7-bin.zip
+          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$HOME/.gradle-dist"
+          echo "$HOME/.gradle-dist/gradle-8.7/bin" >> "$GITHUB_PATH"
+          "$HOME/.gradle-dist/gradle-8.7/bin/gradle" --version
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Show APK
+        run: ls -lh app/build/outputs/apk/debug/
+
+      - name: Upload APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: yolo-overlay-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      #  Releases 里的附件不需要登录就能下载，手机上直接点链接就能装
+      - name: Publish APK to Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "build-${{ github.run_number }}" \
+            app/build/outputs/apk/debug/app-debug.apk \
+            --title "APK build ${{ github.run_number }}" \
+            --notes "自动构建产物。直接下载 app-debug.apk 到手机安装即可。" \
+          || echo "release 已存在，跳过"
