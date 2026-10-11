@@ -44,14 +44,15 @@ jobs:
           python tools/export_yolov8.py --model yolov8n.pt --imgsz 640
           ls -lh app/src/main/assets/
 
-      # 关键：把模型的真实输入/输出形状打出来。
-      # YoloDetector 会在运行时探测输出布局，但如果导出格式不对（比如带了 NMS），
-      # 这一步的日志能立刻看出来，不用等装到手机上才发现。
-      - name: Verify ONNX model shapes
+      # 关键：把模型的真实输入/输出形状打出来，并且**真的跑一次推理**。
+      # YoloDetector 会在运行时探测输入(NCHW/NHWC)与输出布局，
+      # 但如果导出格式不对（比如带了 NMS、或维度对不上），
+      # 这一步的日志能立刻看出来，不用等装到手机上才发现一个框都画不出来。
+      - name: Verify ONNX model shapes + smoke test
         run: |
-          python -c "import onnxruntime" 2>/dev/null || pip install onnxruntime
+          python -c "import onnxruntime" 2>/dev/null || pip install onnxruntime numpy
           python - <<'PY'
-          import glob, onnxruntime as ort
+          import glob, numpy as np, onnxruntime as ort
           p = glob.glob("app/src/main/assets/*.onnx")[0]
           s = ort.InferenceSession(p, providers=["CPUExecutionProvider"])
           print("模型文件:", p)
@@ -59,8 +60,15 @@ jobs:
               print("  INPUT ", i.name, i.shape, i.type)
           for o in s.get_outputs():
               print("  OUTPUT", o.name, o.shape, o.type)
-          print(">> 期望: INPUT  [1,640,640,3] float32")
-          print(">> 期望: OUTPUT 含一维 = 84 (4+80) 的 [1,84,8400] 或 [1,8400,84]")
+          assert len(s.get_outputs()) == 1, "输出必须只有 1 个张量（不要用 nms=True 导出）"
+          ins = s.get_inputs()[0]
+          shape = [d if isinstance(d, int) and d > 0 else 1 for d in ins.shape]
+          print(">> 用全零输入跑一次:", shape)
+          out = s.run(None, {ins.name: np.zeros(shape, dtype=np.float32)})
+          print(">> 推理成功，输出形状:", [o.shape for o in out])
+          n = 4 + 80
+          assert any(n in o.shape for o in out), f"输出里找不到 {n} 通道 (4 + 80 类)"
+          print(">> 形状校验通过 ✔")
           PY
 
       # ---------------------------------------------------------------- 构建

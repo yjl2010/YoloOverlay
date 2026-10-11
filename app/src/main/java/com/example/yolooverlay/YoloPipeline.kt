@@ -279,7 +279,7 @@ class YoloPipeline(
                 context = context,
                 labels = CocoLabels.NAMES,
                 modelAsset = config.modelAsset,
-                inputSize = config.inputSize,
+                inputSizeHint = config.inputSize,
                 initialConf = confThreshold,
                 numThreads = config.numThreads,
                 useNnapi = config.useNnapi

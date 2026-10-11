@@ -20,18 +20,19 @@ import kotlin.math.roundToInt
  * 输入：一帧 ARGB_8888 的 IntArray（来自 MediaProjection 的 RGBA 采集） + 宽高
  * 输出：原图坐标系下的检测框列表
  *
- * 模型：`model.export(format="onnx", imgsz=640)` 的产物，即
- *   输入  images   [1, 640, 640, 3] float32, RGB, 归一化到 0..1
- *   输出  output0  [1, 4+nc, 8400] float32, 已经过 sigmoid（v8 无 objectness 分支）
- * 代码会在运行时探测输出布局，[1, 8400, 4+nc] 或二维输出也能正确解析。
+ * 关键设计：**输入布局在运行时探测**，不写死。
+ *   PyTorch 原生是 NCHW，所以 ultralytics 的 ONNX 导出通常是 `images [1,3,640,640]`；
+ *   但某些导出配置（以及 TFLite 系）会给 NHWC `[1,640,640,3]`。
+ *   两种都支持，避免以后换导出参数就整个跑不起来。
  *
- * 为什么不用 TFLite：见 tools/export_yolov8.py 顶部注释。
+ * 输出同样探测：`[1, 4+nc, 8400]` 或 `[1, 8400, 4+nc]` 都能识别。
  */
 class YoloDetector(
     context: Context,
     private val labels: List<String>,
     modelAsset: String = "yolov8n.onnx",
-    val inputSize: Int = 640,
+    /** 仅在模型输入维度是动态 (-1) 时作为兜底 */
+    inputSizeHint: Int = 640,
     initialConf: Float = 0.25f,
     initialIou: Float = 0.45f,
     private val maxDetections: Int = 50,
@@ -50,13 +51,18 @@ class YoloDetector(
     private val session: OrtSession
     private val inputName: String
     private val inputShape: LongArray
-    private val inputBuffer: FloatBuffer
-    private val inputFloats = FloatArray(inputSize * inputSize * 3)
 
-    private var outFloats = FloatArray(0)
+    /** 模型输入是否为 NCHW（通道在前） */
+    private val channelFirst: Boolean
+    private val netSize: Int
+    private val planeSize: Int
+    private val inputFloats: FloatArray
+    private val inputBuffer: FloatBuffer
+
+    private var outFloats: FloatArray = FloatArray(0)
 
     // 输出布局缓存
-    private var channelsFirst = true
+    private var outChannelsFirst = true
     private var numAnchors = 0
     private var numChannels = 0
 
@@ -76,12 +82,12 @@ class YoloDetector(
             try {
                 options.addNnapi()
             } catch (t: Throwable) {
-                Log.w(TAG, "NNAPI 不可用，回退到 CPU", t)
+                Log.w(TAG, "NNAPI 不可用，回退 CPU", t)
             }
         }
 
         val modelBytes = loadModelBytes(context, modelAsset)
-        Log.i(TAG, "模型 ${modelAsset} 读取完成 ${modelBytes.size} 字节")
+        Log.i(TAG, "模型 $modelAsset 读取完成 ${modelBytes.size} 字节")
 
         session = env.createSession(modelBytes, options)
         try {
@@ -89,22 +95,55 @@ class YoloDetector(
         } catch (_: Throwable) {
         }
 
+        // ---------------------------------------------------------- 输入布局探测
         inputName = session.inputNames.first()
-        inputShape = longArrayOf(1L, inputSize.toLong(), inputSize.toLong(), 3L)
+        val inInfo = session.inputInfo[inputName]
+        if (inInfo !is TensorInfo) error("无法读取输入张量信息 $inputName")
+        val rawIn = inInfo.shape.map { it.toInt() }.toIntArray()
+
+        var size = inputSizeHint
+        var chFirst = true
+        when {
+            rawIn.size == 4 && rawIn[1] == 3 -> {
+                // NCHW: [1,3,H,W]
+                chFirst = true
+                if (rawIn[2] > 0) size = rawIn[2]
+            }
+            rawIn.size == 4 && rawIn[3] == 3 -> {
+                // NHWC: [1,H,W,3]
+                chFirst = false
+                if (rawIn[1] > 0) size = rawIn[1]
+            }
+            else -> {
+                Log.w(TAG, "输入形状 ${rawIn.toList()} 不是标准四维，按 NCHW 处理")
+            }
+        }
+        channelFirst = chFirst
+        netSize = size
+        planeSize = netSize * netSize
+        inputShape = if (channelFirst) {
+            longArrayOf(1L, 3L, netSize.toLong(), netSize.toLong())
+        } else {
+            longArrayOf(1L, netSize.toLong(), netSize.toLong(), 3L)
+        }
+        inputFloats = FloatArray(planeSize * 3)
         inputBuffer = ByteBuffer
-            .allocateDirect(inputSize * inputSize * 3 * 4)
+            .allocateDirect(planeSize * 3 * 4)
             .order(ByteOrder.nativeOrder())
             .asFloatBuffer()
 
+        // ---------------------------------------------------------- 输出布局探测
         val outName = session.outputNames.first()
-        val info = session.outputInfo[outName]
-        if (info !is TensorInfo) error("无法读取输出张量信息")
-        prepareOutputLayout(info.shape.map { it.toInt() }.toIntArray())
+        val outInfo = session.outputInfo[outName]
+        if (outInfo !is TensorInfo) error("无法读取输出张量信息 $outName")
+        prepareOutputLayout(outInfo.shape.map { it.toInt() }.toIntArray())
 
         Log.i(
             TAG,
-            "模型已加载 input=$inputName ${inputShape.toList()} output=$outName " +
-                "channelsFirst=$channelsFirst anchors=$numAnchors channels=$numChannels"
+            "模型已加载 输入=$inputName ${rawIn.toList()} " +
+                "(${if (channelFirst) "NCHW" else "NHWC"}, $netSize) " +
+                "输出=$outName channelsFirst=$outChannelsFirst " +
+                "anchors=$numAnchors channels=$numChannels"
         )
     }
 
@@ -116,18 +155,18 @@ class YoloDetector(
         when (shape.size) {
             3 -> {
                 if (shape[1] == expect) {
-                    channelsFirst = true; numChannels = shape[1]; numAnchors = shape[2]
+                    outChannelsFirst = true; numChannels = shape[1]; numAnchors = shape[2]
                 } else if (shape[2] == expect) {
-                    channelsFirst = false; numChannels = shape[2]; numAnchors = shape[1]
+                    outChannelsFirst = false; numChannels = shape[2]; numAnchors = shape[1]
                 } else {
                     error("无法识别的输出形状 ${shape.toList()}，期望包含 $expect 个通道")
                 }
             }
             2 -> {
                 if (shape[0] == expect) {
-                    channelsFirst = true; numChannels = shape[0]; numAnchors = shape[1]
+                    outChannelsFirst = true; numChannels = shape[0]; numAnchors = shape[1]
                 } else {
-                    channelsFirst = false; numChannels = shape[1]; numAnchors = shape[0]
+                    outChannelsFirst = false; numChannels = shape[1]; numAnchors = shape[0]
                 }
             }
             else -> error("不支持的输出维度 ${shape.size}: ${shape.toList()}")
@@ -141,11 +180,11 @@ class YoloDetector(
     fun detect(pixels: IntArray, srcWidth: Int, srcHeight: Int): List<Detection> {
         if (srcWidth <= 1 || srcHeight <= 1 || pixels.size < srcWidth * srcHeight) return emptyList()
 
-        val scale = min(inputSize.toFloat() / srcWidth, inputSize.toFloat() / srcHeight)
+        val scale = min(netSize.toFloat() / srcWidth, netSize.toFloat() / srcHeight)
         val newW = max(1, (srcWidth * scale).roundToInt())
         val newH = max(1, (srcHeight * scale).roundToInt())
-        val padX = (inputSize - newW) / 2
-        val padY = (inputSize - newH) / 2
+        val padX = (netSize - newW) / 2
+        val padY = (netSize - newH) / 2
 
         letterbox(pixels, srcWidth, srcHeight, newW, newH, padX, padY)
 
@@ -168,6 +207,10 @@ class YoloDetector(
         return if (kept.size > maxDetections) kept.subList(0, maxDetections) else kept
     }
 
+    /**
+     * 把源帧等比缩放进 netSize×netSize 的 letterbox，其余填 114/255。
+     * 按探测到的布局写：NCHW 写成分平面，NHWC 写成 RGB 交错。
+     */
     private fun letterbox(
         pixels: IntArray,
         srcWidth: Int,
@@ -181,24 +224,40 @@ class YoloDetector(
 
         val xRatio = srcWidth.toFloat() / newW
         val yRatio = srcHeight.toFloat() / newH
-        val dstStride = inputSize * 3
 
-        for (dy in 0 until newH) {
-            val sy = min(srcHeight - 1, (dy * yRatio).toInt())
-            val srcRow = sy * srcWidth
-            var d = (dy + padY) * dstStride + padX * 3
-            for (dx in 0 until newW) {
-                val sx = min(srcWidth - 1, (dx * xRatio).toInt())
-                val px = pixels[srcRow + sx]
-                inputFloats[d++] = ((px ushr 16) and 0xFF) / 255f
-                inputFloats[d++] = ((px ushr 8) and 0xFF) / 255f
-                inputFloats[d++] = (px and 0xFF) / 255f
+        if (channelFirst) {
+            for (dy in 0 until newH) {
+                val sy = min(srcHeight - 1, (dy * yRatio).toInt())
+                val srcRow = sy * srcWidth
+                var dst = (dy + padY) * netSize + padX
+                for (dx in 0 until newW) {
+                    val sx = min(srcWidth - 1, (dx * xRatio).toInt())
+                    val px = pixels[srcRow + sx]
+                    inputFloats[dst] = ((px ushr 16) and 0xFF) / 255f
+                    inputFloats[planeSize + dst] = ((px ushr 8) and 0xFF) / 255f
+                    inputFloats[planeSize * 2 + dst] = (px and 0xFF) / 255f
+                    dst++
+                }
+            }
+        } else {
+            val dstStride = netSize * 3
+            for (dy in 0 until newH) {
+                val sy = min(srcHeight - 1, (dy * yRatio).toInt())
+                val srcRow = sy * srcWidth
+                var dst = (dy + padY) * dstStride + padX * 3
+                for (dx in 0 until newW) {
+                    val sx = min(srcWidth - 1, (dx * xRatio).toInt())
+                    val px = pixels[srcRow + sx]
+                    inputFloats[dst++] = ((px ushr 16) and 0xFF) / 255f
+                    inputFloats[dst++] = ((px ushr 8) and 0xFF) / 255f
+                    inputFloats[dst++] = (px and 0xFF) / 255f
+                }
             }
         }
     }
 
     private fun value(channel: Int, anchor: Int): Float =
-        if (channelsFirst) outFloats[channel * numAnchors + anchor]
+        if (outChannelsFirst) outFloats[channel * numAnchors + anchor]
         else outFloats[anchor * numChannels + channel]
 
     private fun decode(
@@ -228,7 +287,7 @@ class YoloDetector(
             val bw = value(2, a)
             val bh = value(3, a)
 
-            // 从 640 letterbox 空间回到源帧像素坐标
+            // 从 netSize 的 letterbox 空间回到源帧像素坐标
             val left = ((cx - bw * 0.5f) - padX) * invScale
             val top = ((cy - bh * 0.5f) - padY) * invScale
             val right = ((cx + bw * 0.5f) - padX) * invScale
