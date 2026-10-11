@@ -20,18 +20,23 @@ import kotlin.math.roundToInt
  * 输入：一帧 ARGB_8888 的 IntArray（来自 MediaProjection 的 RGBA 采集） + 宽高
  * 输出：原图坐标系下的检测框列表
  *
- * 关键设计：**输入布局在运行时探测**，不写死。
- *   PyTorch 原生是 NCHW，所以 ultralytics 的 ONNX 导出通常是 `images [1,3,640,640]`；
- *   但某些导出配置（以及 TFLite 系）会给 NHWC `[1,640,640,3]`。
- *   两种都支持，避免以后换导出参数就整个跑不起来。
+ * ## 设计原则：不依赖 ORT 的元数据 API
  *
- * 输出同样探测：`[1, 4+nc, 8400]` 或 `[1, 8400, 4+nc]` 都能识别。
+ * `OrtSession.getInputInfo()` / `getOutputInfo()` 在部分 Android 设备/版本上会返回
+ * 非 TensorInfo 甚至空 map（参见 microsoft/onnxruntime#31198），因此在真机上直接
+ * `info as TensorInfo` 是不安全的。本实现：
+ *
+ *   1. 元数据**只作为最佳努力的提示**，整段包在 try/catch 里；
+ *   2. 拿不到就按 ultralytics ONNX 的默认布局（NCHW / 输出 [1,84,8400]）装配；
+ *   3. **启动时做一次预热推理**：失败了就换另一种输入布局再试一次，
+ *      都失败才抛异常，并把真实原因带出去；
+ *   4. 输出锚点数是**从实际输出元素个数反推**的，不靠元数据。
  */
 class YoloDetector(
     context: Context,
     private val labels: List<String>,
     modelAsset: String = "yolov8n.onnx",
-    /** 仅在模型输入维度是动态 (-1) 时作为兜底 */
+    /** 网络输入边长；仅当模型元数据和预热都拿不到尺寸时作为兜底 */
     inputSizeHint: Int = 640,
     initialConf: Float = 0.25f,
     initialIou: Float = 0.45f,
@@ -50,23 +55,23 @@ class YoloDetector(
     private val env: OrtEnvironment = OrtEnvironment.getEnvironment()
     private val session: OrtSession
     private val inputName: String
-    private val inputShape: LongArray
 
-    /** 模型输入是否为 NCHW（通道在前） */
-    private val channelFirst: Boolean
-    private val netSize: Int
-    private val planeSize: Int
-    private val inputFloats: FloatArray
-    private val inputBuffer: FloatBuffer
+    // 输入布局（预热阶段可能被改写）
+    private var channelFirst = true
+    private var netSize = inputSizeHint
+    private var planeSize = inputSizeHint * inputSizeHint
+    private var inputShape: LongArray = longArrayOf(1, 3, inputSizeHint.toLong(), inputSizeHint.toLong())
+    private lateinit var inputFloats: FloatArray
+    private lateinit var inputBuffer: FloatBuffer
 
-    private var outFloats: FloatArray = FloatArray(0)
-
-    // 输出布局缓存
+    // 输出布局
     private var outChannelsFirst = true
     private var numAnchors = 0
     private var numChannels = 0
+    private var outFloats = FloatArray(0)
 
     private val numClasses = labels.size
+    private val expectChannels = 4 + labels.size
 
     init {
         require(labels.isNotEmpty()) { "labels 不能为空" }
@@ -95,84 +100,150 @@ class YoloDetector(
         } catch (_: Throwable) {
         }
 
-        // ---------------------------------------------------------- 输入布局探测
         inputName = session.inputNames.first()
-        val inInfo = session.inputInfo[inputName]
-        if (inInfo !is TensorInfo) error("无法读取输入张量信息 $inputName")
-        val rawIn = inInfo.shape.map { it.toInt() }.toIntArray()
 
-        var size = inputSizeHint
-        var chFirst = true
-        when {
-            rawIn.size == 4 && rawIn[1] == 3 -> {
-                // NCHW: [1,3,H,W]
-                chFirst = true
-                if (rawIn[2] > 0) size = rawIn[2]
-            }
-            rawIn.size == 4 && rawIn[3] == 3 -> {
-                // NHWC: [1,H,W,3]
-                chFirst = false
-                if (rawIn[1] > 0) size = rawIn[1]
-            }
-            else -> {
-                Log.w(TAG, "输入形状 ${rawIn.toList()} 不是标准四维，按 NCHW 处理")
-            }
+        // ---------------------------------------------------- 1. 输入布局
+        configureInputFromMetadata()
+
+        // ---------------------------------------------------- 2. 预热
+        var warm = warmUpOnce()
+        if (warm == null && channelFirst) {
+            // 有些导出是 NHWC。NCHW 失败就换过来再试一次。
+            Log.w(TAG, "NCHW 预热失败，改用 NHWC 重试")
+            configureInput(false, netSize)
+            warm = warmUpOnce()
         }
+        val warmed = warm
+            ?: error("模型无法推理：NCHW 与 NHWC 两种输入布局都失败（model=$modelAsset）")
+
+        // ---------------------------------------------------- 3. 输出布局
+        configureOutput(warmed.first, warmed.second)
+
+        Log.i(
+            TAG,
+            "模型就绪 输入=$inputName ${if (channelFirst) "NCHW" else "NHWC"} " +
+                "net=$netSize 输出=${if (outChannelsFirst) "C-first" else "C-last"} " +
+                "anchors=$numAnchors channels=$numChannels"
+        )
+    }
+
+    // ------------------------------------------------------------------ 装配
+
+    private fun loadModelBytes(context: Context, assetName: String): ByteArray =
+        context.assets.open(assetName).use { it.readBytes() }
+
+    /** 元数据是「能读到最好」，读不到不算错误。 */
+    private fun metadataShape(name: String, isInput: Boolean): IntArray? {
+        return try {
+            val info = if (isInput) session.inputInfo[name] else session.outputInfo[name]
+            val ti = info as? TensorInfo ?: run {
+                Log.w(TAG, "元数据不是 TensorInfo: ${if (isInput) "输入" else "输出"} $name -> $info")
+                return null
+            }
+            ti.shape.map { it.toInt() }.toIntArray()
+        } catch (t: Throwable) {
+            Log.w(TAG, "读取元数据异常(${if (isInput) "输入" else "输出"} $name): $t")
+            null
+        }
+    }
+
+    private fun configureInputFromMetadata() {
+        val shape = metadataShape(inputName, true)
+        if (shape != null && shape.size == 4) {
+            when {
+                shape[1] == 3 -> configureInput(true, shape[2].takeIf { it > 0 } ?: inputSizeHint)
+                shape[3] == 3 -> configureInput(false, shape[1].takeIf { it > 0 } ?: inputSizeHint)
+                else -> {
+                    Log.w(TAG, "输入形状 ${shape.toList()} 不是 NCHW/NHWC，按 NCHW 处理")
+                    configureInput(true, inputSizeHint)
+                }
+            }
+        } else {
+            Log.w(
+                TAG,
+                "拿不到输入形状，按 ultralytics ONNX 默认 NCHW " +
+                    "[1,3,$inputSizeHint,$inputSizeHint] 装配"
+            )
+            configureInput(true, inputSizeHint)
+        }
+    }
+
+    private fun configureInput(chFirst: Boolean, size: Int) {
         channelFirst = chFirst
         netSize = size
-        planeSize = netSize * netSize
-        inputShape = if (channelFirst) {
-            longArrayOf(1L, 3L, netSize.toLong(), netSize.toLong())
+        planeSize = size * size
+        inputShape = if (chFirst) {
+            longArrayOf(1L, 3L, size.toLong(), size.toLong())
         } else {
-            longArrayOf(1L, netSize.toLong(), netSize.toLong(), 3L)
+            longArrayOf(1L, size.toLong(), size.toLong(), 3L)
         }
         inputFloats = FloatArray(planeSize * 3)
         inputBuffer = ByteBuffer
             .allocateDirect(planeSize * 3 * 4)
             .order(ByteOrder.nativeOrder())
             .asFloatBuffer()
-
-        // ---------------------------------------------------------- 输出布局探测
-        val outName = session.outputNames.first()
-        val outInfo = session.outputInfo[outName]
-        if (outInfo !is TensorInfo) error("无法读取输出张量信息 $outName")
-        prepareOutputLayout(outInfo.shape.map { it.toInt() }.toIntArray())
-
-        Log.i(
-            TAG,
-            "模型已加载 输入=$inputName ${rawIn.toList()} " +
-                "(${if (channelFirst) "NCHW" else "NHWC"}, $netSize) " +
-                "输出=$outName channelsFirst=$outChannelsFirst " +
-                "anchors=$numAnchors channels=$numChannels"
-        )
     }
 
-    private fun loadModelBytes(context: Context, assetName: String): ByteArray =
-        context.assets.open(assetName).use { it.readBytes() }
+    /**
+     * 跑一次全灰图。返回 (输出元素总数, 输出形状 or null)；失败返回 null。
+     * 顺便把 ORT 的图优化触发掉，让第一帧真实推理更快。
+     */
+    private fun warmUpOnce(): Pair<Int, IntArray?>? {
+        return try {
+            Arrays.fill(inputFloats, PAD_VALUE)
+            inputBuffer.clear()
+            inputBuffer.put(inputFloats)
+            inputBuffer.rewind()
 
-    private fun prepareOutputLayout(shape: IntArray) {
-        val expect = 4 + numClasses
-        when (shape.size) {
-            3 -> {
-                if (shape[1] == expect) {
-                    outChannelsFirst = true; numChannels = shape[1]; numAnchors = shape[2]
-                } else if (shape[2] == expect) {
-                    outChannelsFirst = false; numChannels = shape[2]; numAnchors = shape[1]
-                } else {
-                    error("无法识别的输出形状 ${shape.toList()}，期望包含 $expect 个通道")
+            OnnxTensor.createTensor(env, inputBuffer, inputShape).use { input ->
+                session.run(mapOf(inputName to input)).use { result ->
+                    val out = result.get(0) as OnnxTensor
+                    val shape = (out.info as? TensorInfo)?.shape?.map { it.toInt() }?.toIntArray()
+                    val total = out.floatBuffer.capacity()
+                    total to shape
                 }
             }
-            2 -> {
-                if (shape[0] == expect) {
+        } catch (t: Throwable) {
+            Log.w(TAG, "预热失败(当前布局 ${if (channelFirst) "NCHW" else "NHWC"}, net=$netSize): $t")
+            null
+        }
+    }
+
+    private fun configureOutput(total: Int, shape: IntArray?) {
+        if (shape != null && shape.size >= 2) {
+            when {
+                shape.size == 3 && shape[1] == expectChannels -> {
+                    outChannelsFirst = true; numChannels = shape[1]; numAnchors = shape[2]
+                }
+                shape.size == 3 && shape[2] == expectChannels -> {
+                    outChannelsFirst = false; numChannels = shape[2]; numAnchors = shape[1]
+                }
+                shape.size == 2 && shape[0] == expectChannels -> {
                     outChannelsFirst = true; numChannels = shape[0]; numAnchors = shape[1]
-                } else {
+                }
+                shape.size == 2 -> {
                     outChannelsFirst = false; numChannels = shape[1]; numAnchors = shape[0]
                 }
             }
-            else -> error("不支持的输出维度 ${shape.size}: ${shape.toList()}")
         }
+
+        if (numAnchors <= 0) {
+            if (total <= 0 || total % expectChannels != 0) {
+                error("输出元素数 $total 无法按 $expectChannels 通道解析（shape=${shape?.toList()}）")
+            }
+            numChannels = expectChannels
+            numAnchors = total / expectChannels
+            outChannelsFirst = true
+            Log.w(
+                TAG,
+                "拿不到输出形状，按元素总数反推：anchors=$numAnchors channels=$numChannels"
+            )
+        }
+
         outFloats = FloatArray(numAnchors * numChannels)
     }
+
+    // ------------------------------------------------------------------ 推理
 
     /**
      * @param pixels ARGB_8888 排列的像素（alpha 会被忽略）
@@ -197,7 +268,8 @@ class YoloDetector(
                 val out = result.get(0) as OnnxTensor
                 val fb = out.floatBuffer
                 fb.rewind()
-                fb.get(outFloats, 0, outFloats.size)
+                val n = min(outFloats.size, fb.remaining())
+                fb.get(outFloats, 0, n)
             }
         }
 
@@ -209,7 +281,7 @@ class YoloDetector(
 
     /**
      * 把源帧等比缩放进 netSize×netSize 的 letterbox，其余填 114/255。
-     * 按探测到的布局写：NCHW 写成分平面，NHWC 写成 RGB 交错。
+     * NCHW 写成分平面，NHWC 写成 RGB 交错。
      */
     private fun letterbox(
         pixels: IntArray,

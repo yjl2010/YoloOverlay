@@ -473,13 +473,34 @@ class OverlayService : Service(), YoloPipeline.Listener {
     }
 
     override fun onError(error: Throwable) {
-        val msg = when (error) {
-            is java.io.FileNotFoundException ->
-                "找不到模型文件 assets/$modelAsset，请先导出并放入 assets/"
-            else -> "推理出错：${error.message}"
+        val detail = describeError(error)
+        Log.e(TAG, "推理错误:\n$detail", error)
+        // 画在屏幕上，用户截个图就能定位（不需要连 adb）
+        overlayView?.showError(detail)
+        toast(detail.lineSequence().first().take(120))
+    }
+
+    /** 把异常链 + 堆栈拼成一段可以直接看懂的诊断文本 */
+    private fun describeError(t: Throwable): String {
+        val sb = StringBuilder()
+        sb.append("⚠ 推理失败\n")
+        if (t is java.io.FileNotFoundException) {
+            sb.append("找不到模型文件 assets/").append(modelAsset).append('\n')
         }
-        Log.e(TAG, msg, error)
-        toast(msg)
+        var e: Throwable? = t
+        var depth = 0
+        while (e != null && depth < 4) {
+            if (depth > 0) sb.append("\n↑ 由 ")
+            sb.append(e.javaClass.name).append(": ").append(e.message ?: "(无消息)")
+            e = e.cause
+            depth++
+        }
+        val frames = t.stackTrace.take(8)
+        if (frames.isNotEmpty()) {
+            sb.append("\n\n堆栈:")
+            for (f in frames) sb.append("\n  ").append(f.toString())
+        }
+        return sb.toString()
     }
 
     // ------------------------------------------------------------ 通知

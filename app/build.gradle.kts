@@ -14,6 +14,12 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+
+        ndk {
+            // 只打包真机用的两种 ABI，去掉 x86/x86_64（只有模拟器用）
+            // APK 从 ~85MB 降到 ~45MB
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
     }
 
     buildTypes {

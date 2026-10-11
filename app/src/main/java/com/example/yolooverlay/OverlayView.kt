@@ -65,7 +65,22 @@ class OverlayView(context: Context) : View(context) {
 
     private val rect = RectF()
     private val hudRect = RectF()
+    private val errorRect = RectF()
     private val currentRects = ArrayList<RectF>(48)
+
+    /** 出错时把原因画在屏幕上，方便截图排查（不用连 adb） */
+    private var errorText: String? = null
+
+    private val errorPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textSize = 11f * density
+        typeface = Typeface.create(Typeface.MONOSPACE, Typeface.NORMAL)
+    }
+
+    private val errorBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+        color = 0xE6B71C1C.toInt()
+    }
 
     fun setActive(value: Boolean) {
         active = value
@@ -74,6 +89,18 @@ class OverlayView(context: Context) : View(context) {
     }
 
     fun isActive() = active
+
+    fun showError(message: String) {
+        errorText = message
+        postInvalidateOnAnimation()
+    }
+
+    fun clearError() {
+        if (errorText != null) {
+            errorText = null
+            postInvalidateOnAnimation()
+        }
+    }
 
     fun update(result: YoloPipeline.DetectionResult) {
         detections = result.detections
@@ -153,6 +180,51 @@ class OverlayView(context: Context) : View(context) {
         }
 
         drawHud(canvas)
+        drawError(canvas)
+    }
+
+    /** 红色错误面板：把异常链和堆栈画出来，截个图就能定位 */
+    private fun drawError(canvas: Canvas) {
+        val msg = errorText ?: return
+        val pad = 10f * density
+        val maxW = width - pad * 4f
+        if (maxW <= 0f) return
+
+        val lines = wrapText(msg, errorPaint, maxW)
+        val lineH = errorPaint.textSize * 1.3f
+        val maxLines = ((height * 0.55f) / lineH).toInt().coerceAtLeast(3)
+        val shown = lines.take(maxLines)
+
+        val h = pad * 2f + lineH * shown.size
+        errorRect.set(pad, pad, width - pad, pad + h)
+        canvas.drawRoundRect(errorRect, 8f * density, 8f * density, errorBgPaint)
+
+        var y = errorRect.top + pad + errorPaint.textSize
+        for (l in shown) {
+            canvas.drawText(l, errorRect.left + pad, y, errorPaint)
+            y += lineH
+        }
+    }
+
+    /** 按字符宽度硬折行；消息很短，性能无所谓 */
+    private fun wrapText(text: String, paint: Paint, maxWidth: Float): List<String> {
+        val out = ArrayList<String>()
+        for (para in text.split("\n")) {
+            if (para.isEmpty()) {
+                out.add("")
+                continue
+            }
+            val sb = StringBuilder()
+            for (ch in para) {
+                if (sb.isNotEmpty() && paint.measureText(sb.toString() + ch) > maxWidth) {
+                    out.add(sb.toString())
+                    sb.setLength(0)
+                }
+                sb.append(ch)
+            }
+            out.add(sb.toString())
+        }
+        return out
     }
 
     private fun drawHud(canvas: Canvas) {
